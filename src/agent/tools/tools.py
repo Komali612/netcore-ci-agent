@@ -4,6 +4,7 @@ This agent discovers .NET Core projects, generates GitHub Actions CI pipelines,
 validates them, and opens PRs for human review.
 """
 from agent_core import Tool
+from ..cookbook import get_recipe, render_steps, render_run
 import json
 import subprocess
 import tempfile
@@ -173,6 +174,58 @@ class GenerateGitHubActionsWorkflow(Tool):
             enable_docker_build: bool = True, enable_helm_update: bool = True) -> dict:
         """Generate GitHub Actions workflow YAML."""
         try:
+            # GENERATE is cookbook-first (ARCHITECTURE.md §2.3): pull the .NET Core
+            # setup/build/test/sonar step bodies from this agent's OWN cookbook, and
+            # fall back to the built-in steps only when no recipe matches the stack.
+            try:
+                recipe = get_recipe("dotnet")
+            except Exception:
+                recipe = None
+            if recipe:
+                setup_steps = render_steps(recipe["setup"])
+                build_steps = render_run("Restore & build", recipe["build"])
+                test_steps = render_run("Run unit tests", recipe["test"])
+                sonar_steps = render_steps(recipe["sonar_steps"])
+                generation_source = "cookbook"
+            else:
+                dv = self._get_dotnet_version(target_framework)
+                setup_steps = (
+                    "      - name: Setup .NET\n"
+                    "        uses: actions/setup-dotnet@v3\n"
+                    "        with:\n"
+                    f"          dotnet-version: '{dv}'"
+                )
+                build_steps = (
+                    "      - name: Restore & build\n"
+                    "        run: |\n"
+                    "          SLN=$(find . -name '*.sln' -print -quit)\n"
+                    "          if [ -n \"$SLN\" ]; then\n"
+                    "            dotnet build \"$SLN\" --configuration Release\n"
+                    "          else\n"
+                    "            for p in $(find . -name '*.csproj'); do\n"
+                    "              echo \"Building $p\"\n"
+                    "              dotnet build \"$p\" --configuration Release\n"
+                    "            done\n"
+                    "          fi"
+                )
+                test_steps = (
+                    "      - name: Run Unit Tests\n"
+                    "        run: |\n"
+                    "          TESTS=$(find . -name '*.csproj' | grep -i test || true)\n"
+                    "          if [ -z \"$TESTS\" ]; then echo \"No test projects found\"; exit 0; fi\n"
+                    "          for p in $TESTS; do\n"
+                    "            echo \"Testing $p\"\n"
+                    "            dotnet test \"$p\" --configuration Release\n"
+                    "          done"
+                )
+                sonar_steps = (
+                    "      - name: Run SonarQube Analysis\n"
+                    "        run: |\n"
+                    "          echo \"SonarQube coverage analysis placeholder\"\n"
+                    "          echo \"Integration with SonarQube via SONAR_HOST_URL and SONAR_TOKEN\""
+                )
+                generation_source = "builtin-fallback"
+
             # Container job — pushes to GHCR using the workflow's built-in
             # GITHUB_TOKEN (no separate registry PAT needed). Built as a plain
             # string so GitHub's ${{ ... }} expressions need no f-string escaping.
@@ -235,23 +288,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v3
-        with:
-          dotnet-version: '{self._get_dotnet_version(target_framework)}'
-
-      - name: Restore & build
-        run: |
-          SLN=$(find . -name '*.sln' -print -quit)
-          if [ -n "$SLN" ]; then
-            dotnet build "$SLN" --configuration Release
-          else
-            for p in $(find . -name '*.csproj'); do
-              echo "Building $p"
-              dotnet build "$p" --configuration Release
-            done
-          fi
+{setup_steps}
+{build_steps}
 
   test:
     needs: build
@@ -259,20 +297,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v3
-        with:
-          dotnet-version: '{self._get_dotnet_version(target_framework)}'
-
-      - name: Run Unit Tests
-        run: |
-          TESTS=$(find . -name '*.csproj' | grep -i test || true)
-          if [ -z "$TESTS" ]; then echo "No test projects found"; exit 0; fi
-          for p in $TESTS; do
-            echo "Testing $p"
-            dotnet test "$p" --configuration Release
-          done
+{setup_steps}
+{test_steps}
 
   sonarqube:
     needs: test
@@ -280,16 +306,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v3
-        with:
-          dotnet-version: '{self._get_dotnet_version(target_framework)}'
-
-      - name: Run SonarQube Analysis
-        run: |
-          echo "SonarQube coverage analysis placeholder"
-          echo "Integration with SonarQube via SONAR_HOST_URL and SONAR_TOKEN"
+{setup_steps}
+{sonar_steps}
 
   security:
     needs: test
@@ -337,6 +355,7 @@ jobs:
                 "workflow_filename": f"{project_name}-ci.yml",
                 "workflow_path": f".github/workflows/{project_name}-ci.yml",
                 "workflow_yaml": workflow_yaml,
+                "generation_source": generation_source,
                 "configuration": {
                     "target_framework": target_framework,
                     "build_tool": build_tool,
