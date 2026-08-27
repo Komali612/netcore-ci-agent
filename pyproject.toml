@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "netcore-ci-agent"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    # Pulled from the agent-core git repo by tag. [anthropic] adds the LLM brain.
+    # For connector extras: "agent-core[anthropic,jira,slack] @ git+...@v0.2.0"
+    "agent-core[anthropic] @ git+https://github.com/Komali612/agent-core@v0.2.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "pygithub>=2.0",
+    "pynacl>=1.5",       # PyGithub uses this to encrypt Actions secret values
+]
+
+[project.scripts]
+agent = "agent.main:main"
+ci-serve = "agent.ci_service:main"   # direct credentialed CI console + POST /ci
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent"]
+
+[tool.hatch.metadata]
+# agent-core is a direct (git URL) reference; hatchling requires opting in.
+# (Not needed once you install agent-core from a version index instead of git.)
+allow-direct-references = true
+
+[dependency-groups]
+# Installed by `uv sync` (dev is a default group) so CI's `uv run pytest` works.
+dev = ["pytest>=8"]
