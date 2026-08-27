@@ -16,7 +16,13 @@ steps, keep human edits.
   Sonar strategy, default Dockerfile). Seeded verbatim from the authoritative
   interim cookbook in `cicd-bootstrap`.
 
-## Status (backlog)
-The agent currently generates in code and does **not yet read this cookbook**
-(ARCHITECTURE.md §6, known drift). The remaining work is to wire `GENERATE` to
-consume `cookbook.yaml` cookbook-first with the LLM as fallback.
+## Status — WIRED ✓
+`GENERATE` now reads this cookbook: `src/agent/cookbook.py` loads `cookbook.yaml`
+and `GenerateGitHubActionsWorkflow` renders the .NET Core setup/build/test/sonar
+steps from it (real coverlet coverage + real Sonar scanner), falling back to the
+built-in steps when no recipe matches. The tool reports which path ran via
+`generation_source` (`cookbook` | `builtin-fallback`).
+
+Remaining (backlog): promote the built-in fallback to an LLM call that also
+*writes the missing cookbook entry*, and extend recipes beyond the single
+`dotnet` (8.0.x) entry as needed.
