@@ -4,12 +4,47 @@ This agent discovers .NET Core projects, generates GitHub Actions CI pipelines,
 validates them, and opens PRs for human review.
 """
 from agent_core import Tool
-from ..cookbook import get_recipe, render_steps, render_run
+from ..cookbook import (
+    TEST_TARGET,
+    expand_step_targets,
+    expand_targets,
+    get_recipe,
+    render_run,
+    render_steps,
+    resolve_build_targets,
+    resolve_sonar_steps,
+    resolve_test_targets,
+)
 import json
+import re
 import subprocess
 import tempfile
 import os
 from pathlib import Path
+
+# Layout-agnostic shell used whenever DISCOVER's layout is unavailable: locate
+# the solution (else every project) at run time. Never emit a bare
+# `dotnet restore`/`build` — it fails with MSB1003 on any repo whose
+# .sln/.csproj live below the root.
+FIND_BUILD_SH = [
+    "SLN=$(find . -name '*.sln' -print -quit)",
+    'if [ -n "$SLN" ]; then',
+    '  dotnet build "$SLN" --configuration Release',
+    "else",
+    "  for p in $(find . -name '*.csproj'); do",
+    '    echo "Building $p"',
+    '    dotnet build "$p" --configuration Release',
+    "  done",
+    "fi",
+]
+FIND_TEST_SH = [
+    "TESTS=$(find . -name '*.csproj' | grep -i test || true)",
+    'if [ -z "$TESTS" ]; then echo "No test projects found"; exit 0; fi',
+    "for p in $TESTS; do",
+    '  echo "Testing $p"',
+    '  dotnet test "$p" --configuration Release',
+    "done",
+]
 
 
 class DiscoverProject(Tool):
@@ -52,6 +87,7 @@ class DiscoverProject(Tool):
                     "repo_url": repo_url,
                     "branch": branch,
                     "project_files": [],
+                    "solution_file": None,
                     "target_framework": None,
                     "build_tool": None,
                     "existing_ci_pipeline": False,
@@ -68,9 +104,16 @@ class DiscoverProject(Tool):
                     dirs[:] = [d for d in dirs if not d.startswith('.')]
 
                     for file in files:
+                        if file.endswith('.sln') and not discovery_result["solution_file"]:
+                            discovery_result["solution_file"] = os.path.relpath(
+                                os.path.join(root, file), clone_path
+                            ).replace(os.sep, "/")
+
                         if file.endswith('.csproj'):
                             discovery_result["project_files"].append(
-                                os.path.relpath(os.path.join(root, file), clone_path)
+                                os.path.relpath(
+                                    os.path.join(root, file), clone_path
+                                ).replace(os.sep, "/")
                             )
                             # Parse for target framework (simplified)
                             try:
@@ -144,6 +187,23 @@ class GenerateGitHubActionsWorkflow(Tool):
                 "enum": [".NET CLI", "MSBuild", "NuGet"],
                 "default": ".NET CLI"
             },
+            "project_files": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Repo-relative .csproj paths from discovery; restore/build/test target these explicitly"
+            },
+            "solution_file": {
+                "type": "string",
+                "description": "Repo-relative .sln path from discovery (takes precedence over project_files)"
+            },
+            "sonar_project_key": {
+                "type": "string",
+                "description": "SonarQube/SonarCloud project key. Defaults to a repo-derived key; must be a real key, never a placeholder."
+            },
+            "sonar_org": {
+                "type": "string",
+                "description": "SonarCloud organization. When set it is inlined into the scan; when absent the /o: flag is omitted (self-hosted SonarQube)."
+            },
             "runner_os": {
                 "type": "string",
                 "description": "Runner OS for the workflow",
@@ -171,7 +231,9 @@ class GenerateGitHubActionsWorkflow(Tool):
 
     def run(self, project_name: str, target_framework: str, build_tool: str = ".NET CLI",
             runner_os: str = "ubuntu-latest", include_dast: bool = True,
-            enable_docker_build: bool = True, enable_helm_update: bool = True) -> dict:
+            enable_docker_build: bool = True, enable_helm_update: bool = True,
+            project_files: list = None, solution_file: str = None,
+            sonar_project_key: str = None, sonar_org: str = None) -> dict:
         """Generate GitHub Actions workflow YAML."""
         try:
             # GENERATE is cookbook-first (ARCHITECTURE.md §2.3): pull the .NET Core
@@ -182,10 +244,33 @@ class GenerateGitHubActionsWorkflow(Tool):
             except Exception:
                 recipe = None
             if recipe:
+                # Recipe commands target the discovered layout (.sln, else each
+                # .csproj); without layout info, the find-based shell stands in.
+                build_targets = resolve_build_targets(solution_file, project_files)
+                test_targets = resolve_test_targets(solution_file, project_files)
+                if build_targets:
+                    build_cmds = expand_targets(list(recipe["build"]), build_targets)
+                else:
+                    build_cmds = FIND_BUILD_SH
+                if test_targets:
+                    test_cmds = expand_targets(
+                        str(recipe["test"]).splitlines(), test_targets, placeholder=TEST_TARGET
+                    )
+                elif build_targets:
+                    test_cmds = ['echo "No test projects found"']
+                else:
+                    test_cmds = FIND_TEST_SH
                 setup_steps = render_steps(recipe["setup"])
-                build_steps = render_run("Restore & build", recipe["build"])
-                test_steps = render_run("Run unit tests", recipe["test"])
-                sonar_steps = render_steps(recipe["sonar_steps"])
+                build_steps = render_run("Restore & build", build_cmds)
+                test_steps = render_run("Run unit tests", test_cmds)
+                # Resolve the Sonar project-key/org placeholders to real values
+                # (a repo-derived key by default) BEFORE rendering, so an
+                # unresolved __SONAR_ORG__ can never reach SonarCloud again.
+                project_key = sonar_project_key or self._default_sonar_key(project_name)
+                sonar_recipe = resolve_sonar_steps(recipe["sonar_steps"], project_key, sonar_org)
+                sonar_steps = render_steps(
+                    expand_step_targets(sonar_recipe, build_targets, empty=FIND_BUILD_SH)
+                )
                 generation_source = "cookbook"
             else:
                 dv = self._get_dotnet_version(target_framework)
@@ -195,29 +280,8 @@ class GenerateGitHubActionsWorkflow(Tool):
                     "        with:\n"
                     f"          dotnet-version: '{dv}'"
                 )
-                build_steps = (
-                    "      - name: Restore & build\n"
-                    "        run: |\n"
-                    "          SLN=$(find . -name '*.sln' -print -quit)\n"
-                    "          if [ -n \"$SLN\" ]; then\n"
-                    "            dotnet build \"$SLN\" --configuration Release\n"
-                    "          else\n"
-                    "            for p in $(find . -name '*.csproj'); do\n"
-                    "              echo \"Building $p\"\n"
-                    "              dotnet build \"$p\" --configuration Release\n"
-                    "            done\n"
-                    "          fi"
-                )
-                test_steps = (
-                    "      - name: Run Unit Tests\n"
-                    "        run: |\n"
-                    "          TESTS=$(find . -name '*.csproj' | grep -i test || true)\n"
-                    "          if [ -z \"$TESTS\" ]; then echo \"No test projects found\"; exit 0; fi\n"
-                    "          for p in $TESTS; do\n"
-                    "            echo \"Testing $p\"\n"
-                    "            dotnet test \"$p\" --configuration Release\n"
-                    "          done"
-                )
+                build_steps = render_run("Restore & build", FIND_BUILD_SH)
+                test_steps = render_run("Run Unit Tests", FIND_TEST_SH)
                 sonar_steps = (
                     "      - name: Run SonarQube Analysis\n"
                     "        run: |\n"
@@ -349,6 +413,23 @@ jobs:
         run: echo "Send execution logs to Splunk (placeholder)"
 """
 
+            # Safety net for the whole __TEMPLATE__ bug class: refuse to ship a
+            # workflow that still carries any unresolved __PLACEHOLDER__ token.
+            # A literal placeholder reaching a runner is always a generator bug
+            # (e.g. __SONAR_ORG__ -> SonarCloud 404), never a valid value.
+            leftover = sorted(set(re.findall(r"__[A-Z0-9_]+__", workflow_yaml)))
+            if leftover:
+                return {
+                    "status": "error",
+                    "error": (
+                        "Refusing to emit a workflow with unresolved template "
+                        "placeholders: " + ", ".join(leftover) + ". These must be "
+                        "resolved at generation (provide the value, e.g. "
+                        "sonar_project_key/sonar_org) or fixed in the cookbook recipe."
+                    ),
+                    "unresolved_placeholders": leftover,
+                }
+
             return {
                 "status": "generated",
                 "project_name": project_name,
@@ -387,6 +468,16 @@ jobs:
             ".NET 8": "8.0.x"
         }
         return mapping.get(target_framework, "8.0.x")
+
+    @staticmethod
+    def _default_sonar_key(project_name: str) -> str:
+        """A safe, non-empty Sonar project key when the caller supplies none.
+
+        The pipeline passes a repo-derived ``<owner>_<repo>`` key; this fallback
+        only guards direct/LLM calls. Never returns an empty string (an empty key
+        fails the scan just like a placeholder would)."""
+        slug = re.sub(r"[^A-Za-z0-9_.:-]+", "_", project_name or "").strip("_")
+        return slug or "app"
 
 
 class ValidateWorkflow(Tool):

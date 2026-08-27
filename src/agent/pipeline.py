@@ -129,6 +129,13 @@ def run_ci_pipeline(
     framework = disc.get("target_framework") or ".NET 8"
     name = project_name or _default_project_name(repo_url)
 
+    # Sonar targeting: a real, repo-derived project key (SonarCloud's own
+    # convention when binding a GitHub repo is "<owner>_<repo>"), and the org
+    # from what the console collected — so the scan never ships __SONAR_*__.
+    full_name = parse_repo_full_name(repo_url)
+    sonar_project_key = options.get("sonar_project_key") or full_name.replace("/", "_")
+    sonar_org = options.get("sonar_org") or (pipeline_secrets or {}).get("SONAR_ORG")
+
     # 2) Generate
     gen = (generate_tool or GenerateGitHubActionsWorkflow()).run(
         project_name=name,
@@ -137,6 +144,10 @@ def run_ci_pipeline(
         include_dast=options.get("include_dast", True),
         enable_docker_build=disc.get("docker_support", True),
         enable_helm_update=disc.get("helm_support", True),
+        project_files=disc.get("project_files") or [],
+        solution_file=disc.get("solution_file"),
+        sonar_project_key=sonar_project_key,
+        sonar_org=sonar_org,
     )
     if gen.get("status") == "error":
         return {"status": "error", "stage": "generate", "error": gen.get("error")}
