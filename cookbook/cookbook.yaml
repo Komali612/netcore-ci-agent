@@ -26,10 +26,13 @@ sonar_strategies:
         java-version: "17"
     - name: "Sonar: install scanner"
       run: dotnet tool install --global dotnet-sonarscanner
+    # __SONAR_PROJECT_KEY__ / __SONAR_ORG__ are resolved by the generator from the
+    # repo + configured org (see cookbook.resolve_sonar_steps); the host URL comes
+    # from the SONAR_HOST_URL secret, defaulting to SonarCloud when unset.
     - name: Sonar scan begin
       run: >-
         dotnet-sonarscanner begin /k:"__SONAR_PROJECT_KEY__" /o:"__SONAR_ORG__"
-        /d:sonar.host.url="https://sonarcloud.io" /d:sonar.token="$SONAR_TOKEN"
+        /d:sonar.host.url="${SONAR_HOST_URL:-https://sonarcloud.io}" /d:sonar.token="$SONAR_TOKEN"
         /d:sonar.qualitygate.wait=false
         /d:sonar.exclusions="**/.github/**,**/Program.cs"
         /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml"

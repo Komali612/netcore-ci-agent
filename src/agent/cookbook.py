@@ -12,6 +12,7 @@ offline.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -124,6 +125,44 @@ def expand_step_targets(steps: list[dict], targets: list[str],
             step["run"] = "\n".join(
                 expand_targets(str(step["run"]).splitlines(), targets, empty=empty)
             )
+        out.append(step)
+    return out
+
+
+# --- Sonar targeting -------------------------------------------------------------
+#
+# The Sonar recipe carries __SONAR_PROJECT_KEY__ / __SONAR_ORG__ markers that MUST
+# be resolved before the workflow ships — an unresolved __SONAR_ORG__ reaches
+# SonarCloud verbatim and 404s the quality-profile lookup (pre-processing fails).
+
+SONAR_PROJECT_KEY = "__SONAR_PROJECT_KEY__"
+SONAR_ORG = "__SONAR_ORG__"
+
+
+def resolve_sonar_steps(steps: list[dict], project_key: str,
+                        org: Optional[str] = None) -> list[dict]:
+    """Fill the Sonar recipe's project-key / organization placeholders.
+
+    - ``__SONAR_PROJECT_KEY__`` -> ``project_key`` (always required; the generator
+      derives it per-repo so it is never blank).
+    - ``/o:"__SONAR_ORG__"`` -> ``/o:"<org>"`` when an organization is known
+      (SonarCloud). When it isn't (self-hosted SonarQube has no organization) the
+      whole ``/o:`` argument is dropped rather than passed empty.
+
+    Returns new step dicts; the inputs are not mutated.
+    """
+    out: list[dict] = []
+    for step in steps:
+        run = step.get("run")
+        if run is not None and ("__SONAR_" in str(run)):
+            step = dict(step)
+            run = str(run).replace(SONAR_PROJECT_KEY, project_key)
+            if org:
+                run = run.replace(SONAR_ORG, org)
+            else:
+                # Drop the /o: flag (and its leading whitespace) entirely.
+                run = re.sub(r'\s*/o:"' + re.escape(SONAR_ORG) + r'"', "", run)
+            step["run"] = run
         out.append(step)
     return out
 

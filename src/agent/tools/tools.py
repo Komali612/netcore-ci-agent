@@ -12,9 +12,11 @@ from ..cookbook import (
     render_run,
     render_steps,
     resolve_build_targets,
+    resolve_sonar_steps,
     resolve_test_targets,
 )
 import json
+import re
 import subprocess
 import tempfile
 import os
@@ -194,6 +196,14 @@ class GenerateGitHubActionsWorkflow(Tool):
                 "type": "string",
                 "description": "Repo-relative .sln path from discovery (takes precedence over project_files)"
             },
+            "sonar_project_key": {
+                "type": "string",
+                "description": "SonarQube/SonarCloud project key. Defaults to a repo-derived key; must be a real key, never a placeholder."
+            },
+            "sonar_org": {
+                "type": "string",
+                "description": "SonarCloud organization. When set it is inlined into the scan; when absent the /o: flag is omitted (self-hosted SonarQube)."
+            },
             "runner_os": {
                 "type": "string",
                 "description": "Runner OS for the workflow",
@@ -222,7 +232,8 @@ class GenerateGitHubActionsWorkflow(Tool):
     def run(self, project_name: str, target_framework: str, build_tool: str = ".NET CLI",
             runner_os: str = "ubuntu-latest", include_dast: bool = True,
             enable_docker_build: bool = True, enable_helm_update: bool = True,
-            project_files: list = None, solution_file: str = None) -> dict:
+            project_files: list = None, solution_file: str = None,
+            sonar_project_key: str = None, sonar_org: str = None) -> dict:
         """Generate GitHub Actions workflow YAML."""
         try:
             # GENERATE is cookbook-first (ARCHITECTURE.md §2.3): pull the .NET Core
@@ -252,8 +263,13 @@ class GenerateGitHubActionsWorkflow(Tool):
                 setup_steps = render_steps(recipe["setup"])
                 build_steps = render_run("Restore & build", build_cmds)
                 test_steps = render_run("Run unit tests", test_cmds)
+                # Resolve the Sonar project-key/org placeholders to real values
+                # (a repo-derived key by default) BEFORE rendering, so an
+                # unresolved __SONAR_ORG__ can never reach SonarCloud again.
+                project_key = sonar_project_key or self._default_sonar_key(project_name)
+                sonar_recipe = resolve_sonar_steps(recipe["sonar_steps"], project_key, sonar_org)
                 sonar_steps = render_steps(
-                    expand_step_targets(recipe["sonar_steps"], build_targets, empty=FIND_BUILD_SH)
+                    expand_step_targets(sonar_recipe, build_targets, empty=FIND_BUILD_SH)
                 )
                 generation_source = "cookbook"
             else:
@@ -397,6 +413,23 @@ jobs:
         run: echo "Send execution logs to Splunk (placeholder)"
 """
 
+            # Safety net for the whole __TEMPLATE__ bug class: refuse to ship a
+            # workflow that still carries any unresolved __PLACEHOLDER__ token.
+            # A literal placeholder reaching a runner is always a generator bug
+            # (e.g. __SONAR_ORG__ -> SonarCloud 404), never a valid value.
+            leftover = sorted(set(re.findall(r"__[A-Z0-9_]+__", workflow_yaml)))
+            if leftover:
+                return {
+                    "status": "error",
+                    "error": (
+                        "Refusing to emit a workflow with unresolved template "
+                        "placeholders: " + ", ".join(leftover) + ". These must be "
+                        "resolved at generation (provide the value, e.g. "
+                        "sonar_project_key/sonar_org) or fixed in the cookbook recipe."
+                    ),
+                    "unresolved_placeholders": leftover,
+                }
+
             return {
                 "status": "generated",
                 "project_name": project_name,
@@ -435,6 +468,16 @@ jobs:
             ".NET 8": "8.0.x"
         }
         return mapping.get(target_framework, "8.0.x")
+
+    @staticmethod
+    def _default_sonar_key(project_name: str) -> str:
+        """A safe, non-empty Sonar project key when the caller supplies none.
+
+        The pipeline passes a repo-derived ``<owner>_<repo>`` key; this fallback
+        only guards direct/LLM calls. Never returns an empty string (an empty key
+        fails the scan just like a placeholder would)."""
+        slug = re.sub(r"[^A-Za-z0-9_.:-]+", "_", project_name or "").strip("_")
+        return slug or "app"
 
 
 class ValidateWorkflow(Tool):
