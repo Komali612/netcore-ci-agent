@@ -137,6 +137,8 @@ def run_ci_pipeline(
         include_dast=options.get("include_dast", True),
         enable_docker_build=disc.get("docker_support", True),
         enable_helm_update=disc.get("helm_support", True),
+        project_files=disc.get("project_files") or [],
+        solution_file=disc.get("solution_file"),
     )
     if gen.get("status") == "error":
         return {"status": "error", "stage": "generate", "error": gen.get("error")}

@@ -4,15 +4,17 @@
 # cookbook, scoped to only the framework that agent owns. This agent owns .NET
 # Core, so this file holds the .NET Core recipe and nothing else.
 #
-# The recipe below is seeded verbatim from the authoritative interim cookbook in
+# The recipe below is seeded from the authoritative interim cookbook in
 # `cicd-bootstrap` (src/cicd_bootstrap/cookbooks/cookbooks.yaml, the `dotnet`
 # entry + its `dotnet` sonar strategy). A recipe declares only the parts that
 # differ per stack; the shared workflow skeleton (name/on/permissions, checkout,
 # the Sonar guard, the image-push phase) is the generator's job.
 #
-# BACKLOG (known drift, see ARCHITECTURE.md §6): this agent currently generates
-# in code and does NOT yet read this cookbook. Wiring GENERATE to be
-# cookbook-first (LLM only as a fallback) is the task that closes that gap.
+# Commands may reference the repo layout via placeholders, resolved by the
+# generator from DISCOVER's results (never assume a root-level project):
+#   __TARGET__       the build target — the .sln when there is one, else each
+#                    discovered .csproj (the line is repeated per target)
+#   __TEST_TARGET__  same, but only test projects
 
 sonar_strategies:
   # The .NET scanner is a global tool that wraps a build and runs on a JVM.
@@ -32,7 +34,7 @@ sonar_strategies:
         /d:sonar.exclusions="**/.github/**,**/Program.cs"
         /d:sonar.cs.opencover.reportsPaths="**/coverage.opencover.xml"
     - name: Sonar build
-      run: dotnet build --configuration Release
+      run: dotnet build "__TARGET__" --configuration Release
     - name: Sonar scan end
       run: dotnet-sonarscanner end /d:sonar.token="$SONAR_TOKEN"
 
@@ -46,15 +48,16 @@ cookbooks:
         with:
           dotnet-version: "8.0.x"
     build:
-      - dotnet restore
-      - dotnet build --configuration Release --no-restore
+      - dotnet restore "__TARGET__"
+      - dotnet build "__TARGET__" --configuration Release --no-restore
     # Collect coverage in OpenCover format (coverlet.collector, via a runsettings)
     # so the Sonar .NET scanner can read it from sonar.cs.opencover.reportsPaths.
+    # No --no-build: the test job runs on its own runner, nothing is built there.
     test: |
       cat > coverlet.runsettings <<'EOF'
       <RunSettings><DataCollectionRunSettings><DataCollectors><DataCollector friendlyName="XPlat Code Coverage"><Configuration><Format>opencover</Format></Configuration></DataCollector></DataCollectors></DataCollectionRunSettings></RunSettings>
       EOF
-      dotnet test --configuration Release --no-build --verbosity normal --collect:"XPlat Code Coverage" --settings coverlet.runsettings --results-directory ./TestResults
+      dotnet test "__TEST_TARGET__" --configuration Release --verbosity normal --collect:"XPlat Code Coverage" --settings coverlet.runsettings --results-directory ./TestResults
     sonar: dotnet
     dockerfile: |
       FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build

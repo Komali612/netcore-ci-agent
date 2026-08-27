@@ -64,6 +64,70 @@ def get_recipe(build_system: str = "dotnet") -> Optional[dict]:
     return recipe
 
 
+# --- Repo-layout targeting -------------------------------------------------------
+#
+# Recipe commands never assume a root-level project (that fails with MSB1003 on
+# any repo whose .sln/.csproj live in subdirectories). Instead they carry the
+# placeholders below, which the generator expands from DISCOVER's results.
+
+BUILD_TARGET = "__TARGET__"
+TEST_TARGET = "__TEST_TARGET__"
+
+
+def resolve_build_targets(solution_file: Optional[str] = None,
+                          project_files: Optional[list[str]] = None) -> list[str]:
+    """The solution when there is one, else every discovered project.
+
+    Empty means the layout is unknown — the caller must fall back to a
+    find-based script, never to bare commands.
+    """
+    if solution_file:
+        return [solution_file]
+    return list(project_files or [])
+
+
+def resolve_test_targets(solution_file: Optional[str] = None,
+                         project_files: Optional[list[str]] = None) -> list[str]:
+    """Test projects only; a lone solution serves when projects weren't listed."""
+    tests = [p for p in (project_files or []) if "test" in p.lower()]
+    if tests:
+        return tests
+    return [solution_file] if solution_file and not project_files else []
+
+
+def expand_targets(lines: list[str], targets: list[str], placeholder: str = BUILD_TARGET,
+                   empty: Optional[list[str]] = None) -> list[str]:
+    """Expand each line containing ``placeholder`` once per target.
+
+    With no targets, such lines are replaced by ``empty`` (or dropped when
+    ``empty`` is None). Lines without the placeholder pass through untouched.
+    """
+    out: list[str] = []
+    for line in lines:
+        if placeholder in line:
+            if targets:
+                out.extend(line.replace(placeholder, t) for t in targets)
+            elif empty is not None:
+                out.extend(empty)
+        else:
+            out.append(line)
+    return out
+
+
+def expand_step_targets(steps: list[dict], targets: list[str],
+                        empty: Optional[list[str]] = None) -> list[dict]:
+    """Expand ``BUILD_TARGET`` inside the ``run`` bodies of a step list."""
+    out: list[dict] = []
+    for step in steps:
+        if "run" in step and BUILD_TARGET in str(step["run"]):
+            step = dict(step)
+            step["run"] = "\n".join(
+                expand_targets(str(step["run"]).splitlines(), targets, empty=empty)
+            )
+        out.append(step)
+    return out
+
+
 # --- YAML fragment renderers (GitHub Actions steps, 6-space step indent) --------
 
 def _scalar(v: Any) -> str:
