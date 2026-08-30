@@ -46,6 +46,37 @@ FIND_TEST_SH = [
     "done",
 ]
 
+# Optional CI capabilities, in the order their steps appear in the single CI job.
+# 'coverage' is the Sonar block (rendered from the sonar strategy); the rest come
+# from the cookbook's tool_steps. A capability that isn't selected in the UI is
+# still emitted, but commented out.
+OPTIONAL_CAPS = ["coverage", "sast", "sca", "dast", "imgscan", "artifact", "registry", "monitoring"]
+
+# Fallback tool names used only when the caller passes no per-capability selection
+# (e.g. the LLM/tool path or a unit test) — keeps behaviour close to the old
+# always-on template. The real orchestrator run passes explicit selections.
+DEFAULT_TOOL_NAME = {
+    "coverage": "SonarQube", "sast": "Fortify", "sca": "Sonatype",
+    "dast": "Fortify WebInspect", "imgscan": "Trivy", "artifact": "Nexus",
+    "registry": "GHCR", "monitoring": "Dynatrace",
+}
+
+
+def comment_block(text: str) -> str:
+    """Comment out a rendered YAML fragment, preserving each line's indentation.
+
+    ``      - name: X``  ->  ``      # - name: X`` (matches the disabled-DAST look).
+    Blank lines are left blank.
+    """
+    out = []
+    for line in text.splitlines():
+        if not line.strip():
+            out.append(line)
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        out.append(f"{indent}# {line.lstrip()}")
+    return "\n".join(out)
+
 
 class DiscoverProject(Tool):
     """Analyze a .NET Core project repository to discover structure and configuration."""
@@ -206,36 +237,42 @@ class GenerateGitHubActionsWorkflow(Tool):
             },
             "runner_os": {
                 "type": "string",
-                "description": "Runner OS for the workflow",
-                "enum": ["ubuntu-latest", "windows-latest"],
-                "default": "ubuntu-latest"
+                "description": "GitHub Actions runner label for runs-on (e.g. ubuntu-latest, windows-latest, or a self-hosted label). Free text; taken from the orchestrator UI. Defaults to ubuntu-latest when blank."
             },
-            "include_dast": {
-                "type": "boolean",
-                "description": "Include DAST stage in pipeline (default: true)",
-                "default": True
-            },
-            "enable_docker_build": {
-                "type": "boolean",
-                "description": "Build Docker image as artifact (default: true)",
-                "default": True
-            },
-            "enable_helm_update": {
-                "type": "boolean",
-                "description": "Update Helm chart after build (default: true)",
-                "default": True
+            "enabled_tools": {
+                "type": "object",
+                "description": "Which optional CI capabilities are selected in the UI, as {capability: tool_name}. Capabilities: coverage, sast, sca, dast, imgscan, artifact, registry, monitoring. A capability that is absent/empty is emitted commented-out. Omit the whole object to enable all with default tool names."
             }
         },
         "required": ["project_name", "target_framework"],
     }
 
     def run(self, project_name: str, target_framework: str, build_tool: str = ".NET CLI",
-            runner_os: str = "ubuntu-latest", include_dast: bool = True,
-            enable_docker_build: bool = True, enable_helm_update: bool = True,
-            project_files: list = None, solution_file: str = None,
-            sonar_project_key: str = None, sonar_org: str = None) -> dict:
-        """Generate GitHub Actions workflow YAML."""
+            runner_os: str = "ubuntu-latest", project_files: list = None,
+            solution_file: str = None, sonar_project_key: str = None,
+            sonar_org: str = None, enabled_tools: dict = None,
+            # Accepted for backward-compat with older callers; no longer used
+            # (Helm removed; DAST/registry are driven by enabled_tools now).
+            include_dast=None, enable_docker_build=None, enable_helm_update=None) -> dict:
+        """Generate a single-job GitHub Actions CI workflow (one checkout).
+
+        The whole pipeline is ONE job: checkout once, then build/test plus the
+        optional CI tool steps. Each optional capability is emitted only when the
+        UI selected a tool for it; otherwise its steps are commented out. The
+        runner label comes from the UI (defaults to ubuntu-latest).
+        """
         try:
+            runner_os = (runner_os or "ubuntu-latest").strip() or "ubuntu-latest"
+
+            # Which optional capabilities are active, and with which tool name.
+            # None => enable all with default names (legacy / LLM-tool path). A
+            # dict (even empty) => only the listed, non-empty capabilities are
+            # active; everything else is emitted commented-out.
+            if enabled_tools is None:
+                caps = dict(DEFAULT_TOOL_NAME)
+            else:
+                caps = {k: v for k, v in enabled_tools.items() if v}
+
             # GENERATE is cookbook-first (ARCHITECTURE.md §2.3): pull the .NET Core
             # setup/build/test/sonar step bodies from this agent's OWN cookbook, and
             # fall back to the built-in steps only when no recipe matches the stack.
@@ -268,9 +305,10 @@ class GenerateGitHubActionsWorkflow(Tool):
                 # unresolved __SONAR_ORG__ can never reach SonarCloud again.
                 project_key = sonar_project_key or self._default_sonar_key(project_name)
                 sonar_recipe = resolve_sonar_steps(recipe["sonar_steps"], project_key, sonar_org)
-                sonar_steps = render_steps(
+                sonar_rendered = render_steps(
                     expand_step_targets(sonar_recipe, build_targets, empty=FIND_BUILD_SH)
                 )
+                tool_templates = recipe.get("tool_steps") or {}
                 generation_source = "cookbook"
             else:
                 dv = self._get_dotnet_version(target_framework)
@@ -281,46 +319,38 @@ class GenerateGitHubActionsWorkflow(Tool):
                     f"          dotnet-version: '{dv}'"
                 )
                 build_steps = render_run("Restore & build", FIND_BUILD_SH)
-                test_steps = render_run("Run Unit Tests", FIND_TEST_SH)
-                sonar_steps = (
+                test_steps = render_run("Run unit tests", FIND_TEST_SH)
+                sonar_rendered = (
                     "      - name: Run SonarQube Analysis\n"
                     "        run: |\n"
-                    "          echo \"SonarQube coverage analysis placeholder\"\n"
-                    "          echo \"Integration with SonarQube via SONAR_HOST_URL and SONAR_TOKEN\""
+                    "          echo \"SonarQube coverage analysis placeholder\""
                 )
+                tool_templates = {}
                 generation_source = "builtin-fallback"
 
-            # Container job — pushes to GHCR using the workflow's built-in
-            # GITHUB_TOKEN (no separate registry PAT needed). Built as a plain
-            # string so GitHub's ${{ ... }} expressions need no f-string escaping.
-            if enable_docker_build:
-                container_job = (
-                    "  container:\n"
-                    "    needs: security\n"
-                    "    runs-on: __RUNNER__\n"
-                    "    permissions:\n"
-                    "      contents: read\n"
-                    "      packages: write\n"
-                    "    steps:\n"
-                    "      - name: Checkout code\n"
-                    "        uses: actions/checkout@v4\n"
-                    "      - name: Log in to GHCR\n"
-                    "        uses: docker/login-action@v3\n"
-                    "        with:\n"
-                    "          registry: ghcr.io\n"
-                    "          username: ${{ github.actor }}\n"
-                    "          password: ${{ secrets.GITHUB_TOKEN }}\n"
-                    "      - name: Build and push image\n"
-                    "        run: |\n"
-                    "          REPO=$(echo \"${{ github.repository }}\" | tr '[:upper:]' '[:lower:]')\n"
-                    "          IMAGE=ghcr.io/$REPO:${{ github.sha }}\n"
-                    "          docker build -t \"$IMAGE\" .\n"
-                    "          docker push \"$IMAGE\"\n"
-                    "      - name: Generate SBOM\n"
-                    "        run: echo 'SBOM generation (placeholder — e.g. Trivy/Syft)'\n"
-                ).replace("__RUNNER__", runner_os)
-            else:
-                container_job = "  # container build disabled in configuration\n"
+            # --- Assemble the SINGLE ci job's steps (one checkout for everything) ---
+            checkout = ("      - name: Checkout code\n"
+                        "        uses: actions/checkout@v4")
+
+            def cap_block(cap):
+                """Rendered steps for an optional capability — active, or, when the
+                UI left it unselected, commented out (visible but inert)."""
+                if cap == "coverage":
+                    rendered, label = sonar_rendered, "COVERAGE (SonarQube/SonarCloud)"
+                else:
+                    steps = tool_templates.get(cap)
+                    if not steps:
+                        return None
+                    rendered, label = render_steps(steps), cap.upper()
+                tool = caps.get(cap)
+                if tool:
+                    return rendered.replace("__TOOL__", tool)
+                header = f"      # {label} - not selected in the orchestrator UI"
+                return header + "\n" + comment_block(rendered.replace("__TOOL__", "not selected"))
+
+            step_blocks = [checkout, setup_steps, build_steps, test_steps]
+            step_blocks += [cap_block(c) for c in OPTIONAL_CAPS]
+            job_steps = "\n".join(b for b in step_blocks if b)
 
             workflow_yaml = f"""name: '{project_name} CI Pipeline'
 
@@ -347,70 +377,13 @@ env:
   REGISTRY_URL: ${{{{ secrets.REGISTRY_URL }}}}
 
 jobs:
-  build:
+  ci:
     runs-on: {runner_os}
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-{setup_steps}
-{build_steps}
-
-  test:
-    needs: build
-    runs-on: {runner_os}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-{setup_steps}
-{test_steps}
-
-  sonarqube:
-    needs: test
-    runs-on: {runner_os}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-{setup_steps}
-{sonar_steps}
-
-  security:
-    needs: test
-    runs-on: {runner_os}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Run SAST (Fortify)
-        run: echo "SAST analysis via Fortify integration (placeholder)"
-
-      - name: Run SCA (Sonatype)
-        run: echo "SCA analysis via Sonatype integration (placeholder)"
-
-{"  dast:" if include_dast else "  # DAST stage disabled in configuration"}
-{"    needs: build" if include_dast else "    # needs: build"}
-{"    runs-on: " + runner_os if include_dast else "    # runs-on: " + runner_os}
-{"    steps:" if include_dast else "    # steps:"}
-{"      - name: Run DAST (Fortify WebInspect)" if include_dast else "      # - name: Run DAST (Fortify WebInspect)"}
-{"        run: echo 'DAST analysis via Fortify WebInspect (placeholder)'" if include_dast else "        # run: echo 'DAST analysis via Fortify WebInspect (placeholder)'"}
-
-{container_job}
-{"  helm:" if enable_helm_update else "  # helm update disabled in configuration"}
-{"    needs: container" if enable_helm_update else "    # needs: container"}
-{"    runs-on: " + runner_os if enable_helm_update else "    # runs-on: " + runner_os}
-{"    steps:" if enable_helm_update else "    # steps:"}
-{"      - name: Update Helm Chart" if enable_helm_update else "      # - name: Update Helm Chart"}
-{"        run: echo 'Update Helm chart (placeholder)'" if enable_helm_update else "        # run: echo 'Update Helm chart (placeholder)'"}
-
-  notify:
-    needs: [build, test, sonarqube, security]
-    runs-on: {runner_os}
-    if: always()
-    steps:
-      - name: Notify Dynatrace
-        run: echo "Send build metrics to Dynatrace (placeholder)"
-
-      - name: Notify Splunk
-        run: echo "Send execution logs to Splunk (placeholder)"
+{job_steps}
 """
 
             # Safety net for the whole __TEMPLATE__ bug class: refuse to ship a
@@ -441,15 +414,14 @@ jobs:
                     "target_framework": target_framework,
                     "build_tool": build_tool,
                     "runner_os": runner_os,
-                    "dast_enabled": include_dast,
-                    "docker_enabled": enable_docker_build,
-                    "helm_enabled": enable_helm_update
+                    "single_job": True,
+                    "enabled_tools": caps,
                 },
                 "notes": [
-                    "Workflow template generated successfully",
-                    "Replace placeholders with actual tool integrations",
-                    "Configure required secrets in GitHub repository settings",
-                    "Required secrets: SONAR_HOST_URL, SONAR_TOKEN, DYNATRACE_ENVIRONMENT_ID, DYNATRACE_API_TOKEN, SPLUNK_HEC_URL, SPLUNK_HEC_TOKEN, NEXUS_REPO_URL, NEXUS_USERNAME, NEXUS_PASSWORD, REGISTRY_URL"
+                    "Single-job pipeline (one checkout for the whole run).",
+                    "Runner (runs-on) is taken from the orchestrator UI; defaults to ubuntu-latest.",
+                    "CI tools left '— not used —' in the UI are emitted commented-out.",
+                    "Configure the GitHub repository secrets for the tools you selected.",
                 ]
             }
 
@@ -529,18 +501,26 @@ class ValidateWorkflow(Tool):
                 validation_result["errors"].append("Missing 'jobs' definition")
                 validation_result["valid"] = False
             else:
-                jobs = workflow_dict["jobs"]
-                required_jobs = ["build", "test", "sonarqube", "security"]
+                jobs = workflow_dict["jobs"] or {}
+                validation_result["checks"]["jobs"] = list(jobs.keys())
 
-                validation_result["checks"]["required_jobs"] = {
-                    "required": required_jobs,
-                    "present": [j for j in required_jobs if j in jobs],
-                    "missing": [j for j in required_jobs if j not in jobs]
-                }
+                # The pipeline is generated as a single job; every job must carry
+                # at least one step (a step-less job fails GitHub's own schema).
+                if not any((j or {}).get("steps") for j in jobs.values()):
+                    validation_result["errors"].append("No job defines any steps")
+                    validation_result["valid"] = False
 
-                if validation_result["checks"]["required_jobs"]["missing"]:
+                # Soft check: the core build/test stages should be present as steps.
+                all_step_names = " ".join(
+                    str(st.get("name", ""))
+                    for j in jobs.values()
+                    for st in ((j or {}).get("steps") or [])
+                    if isinstance(st, dict)
+                ).lower()
+                missing_stages = [s for s in ("build", "test") if s not in all_step_names]
+                if missing_stages:
                     validation_result["warnings"].append(
-                        f"Missing recommended jobs: {validation_result['checks']['required_jobs']['missing']}"
+                        f"Expected step(s) not found by name: {missing_stages}"
                     )
 
             validation_result["checks"]["yaml_syntax"] = "valid"

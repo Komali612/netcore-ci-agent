@@ -52,6 +52,7 @@ def ci(req: CIRequest) -> dict:
             github_token=req.github_token,
             options=req.options or {},
             pipeline_secrets=pipeline_secrets,
+            selected_tools=req.selected_tools,
         )
     except Exception as exc:  # return a clean error, never echo the token
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}

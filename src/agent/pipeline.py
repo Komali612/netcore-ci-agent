@@ -76,6 +76,37 @@ def to_actions_secrets(selected_tools: dict) -> dict:
     return out
 
 
+# Orchestrator UI capability label -> the generator's internal capability key.
+# (Metrics/APM and Log aggregation both feed the single "monitoring" step.)
+CAP_BY_LABEL = {
+    "Code coverage & quality": "coverage",
+    "SAST (static analysis)": "sast",
+    "SCA (dependency scan)": "sca",
+    "DAST (dynamic scan)": "dast",
+    "Container image scan": "imgscan",
+    "Artifact repository": "artifact",
+    "Container registry": "registry",
+    "Metrics / APM": "monitoring",
+    "Log aggregation": "monitoring",
+}
+
+
+def selected_caps(selected_tools: Optional[dict]) -> dict:
+    """Translate the UI's ``{capability_label: {tool, ...}}`` into
+    ``{internal_capability: tool_name}``. Capabilities the user left unselected
+    are absent (the generator then comments their steps out). First tool wins
+    when two labels map to the same capability (e.g. metrics before logs)."""
+    caps: dict = {}
+    for label, entry in (selected_tools or {}).items():
+        cap = CAP_BY_LABEL.get(label)
+        if not cap:
+            continue
+        tool = entry.get("tool") if isinstance(entry, dict) else None
+        if tool:
+            caps.setdefault(cap, tool)
+    return caps
+
+
 def _default_project_name(repo_url: str) -> str:
     tail = parse_repo_full_name(repo_url).split("/")[-1]
     cleaned = re.sub(r"[^A-Za-z0-9]+", " ", tail).title().replace(" ", "")
@@ -106,6 +137,7 @@ def run_ci_pipeline(
     project_name: Optional[str] = None,
     options: Optional[dict] = None,
     pipeline_secrets: Optional[dict] = None,
+    selected_tools: Optional[dict] = None,
     repo=None,
     discover_tool=None,
     generate_tool=None,
@@ -136,14 +168,21 @@ def run_ci_pipeline(
     sonar_project_key = options.get("sonar_project_key") or full_name.replace("/", "_")
     sonar_org = options.get("sonar_org") or (pipeline_secrets or {}).get("SONAR_ORG")
 
+    # Runner comes from the orchestrator UI (free-text); blank -> ubuntu-latest.
+    runner_os = (options.get("runner_os") or "").strip() or "ubuntu-latest"
+
+    # Which optional CI tools the UI selected -> {capability: tool_name}. A
+    # capability the user left "— not used —" is simply absent here, and the
+    # generator emits its steps commented-out.
+    enabled_tools = selected_caps(selected_tools)
+
     # 2) Generate
     gen = (generate_tool or GenerateGitHubActionsWorkflow()).run(
         project_name=name,
         target_framework=framework,
         build_tool=disc.get("build_tool") or ".NET CLI",
-        include_dast=options.get("include_dast", True),
-        enable_docker_build=disc.get("docker_support", True),
-        enable_helm_update=disc.get("helm_support", True),
+        runner_os=runner_os,
+        enabled_tools=enabled_tools,
         project_files=disc.get("project_files") or [],
         solution_file=disc.get("solution_file"),
         sonar_project_key=sonar_project_key,

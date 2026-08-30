@@ -55,13 +55,51 @@ cookbooks:
       - dotnet build "__TARGET__" --configuration Release --no-restore
     # Collect coverage in OpenCover format (coverlet.collector, via a runsettings)
     # so the Sonar .NET scanner can read it from sonar.cs.opencover.reportsPaths.
-    # No --no-build: the test job runs on its own runner, nothing is built there.
     test: |
       cat > coverlet.runsettings <<'EOF'
       <RunSettings><DataCollectionRunSettings><DataCollectors><DataCollector friendlyName="XPlat Code Coverage"><Configuration><Format>opencover</Format></Configuration></DataCollector></DataCollectors></DataCollectionRunSettings></RunSettings>
       EOF
       dotnet test "__TEST_TARGET__" --configuration Release --verbosity normal --collect:"XPlat Code Coverage" --settings coverlet.runsettings --results-directory ./TestResults
     sonar: dotnet
+    # Optional, capability-gated CI steps. The whole pipeline is generated as ONE
+    # job with a single checkout; each block below is included only when its tool
+    # is selected in the orchestrator UI, and commented out (leading #) when the
+    # capability is left "— not used —". __TOOL__ is replaced with the selected
+    # tool's name. Edit these to change what each CI tool step does.
+    tool_steps:
+      sast:
+        - name: "Run SAST (__TOOL__)"
+          run: echo "SAST analysis via __TOOL__ (placeholder)"
+      sca:
+        - name: "Run SCA (__TOOL__)"
+          run: echo "SCA analysis via __TOOL__ (placeholder)"
+      dast:
+        - name: "Run DAST (__TOOL__)"
+          run: echo "DAST analysis via __TOOL__ (placeholder)"
+      imgscan:
+        - name: "Scan container image (__TOOL__)"
+          run: echo "Container image scan via __TOOL__ (placeholder)"
+      artifact:
+        - name: "Publish artifacts (__TOOL__)"
+          run: echo "Publish build artifacts to __TOOL__ (placeholder)"
+      registry:
+        - name: "Log in to registry (__TOOL__)"
+          uses: docker/login-action@v3
+          with:
+            registry: ghcr.io
+            username: '${{ github.actor }}'
+            password: '${{ secrets.GITHUB_TOKEN }}'
+        - name: Build and push image
+          run: |
+            REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+            IMAGE=ghcr.io/$REPO:${{ github.sha }}
+            docker build -t "$IMAGE" .
+            docker push "$IMAGE"
+        - name: Generate SBOM
+          run: echo "SBOM generation (placeholder - e.g. Trivy/Syft)"
+      monitoring:
+        - name: "Send telemetry (__TOOL__)"
+          run: echo "Send build metrics/logs to __TOOL__ (placeholder)"
     dockerfile: |
       FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
       WORKDIR /src
