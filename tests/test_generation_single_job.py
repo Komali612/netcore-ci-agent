@@ -80,10 +80,23 @@ def test_no_placeholder_ships_in_any_state():
 
 def test_registry_block_active_only_when_selected():
     with_reg = _gen(enabled_tools={"registry": "GHCR"})
-    assert "docker push" in with_reg and re.search(r"^\s+- name: 'Build and push image'", with_reg, re.M)
+    # build+push via build-push-action with an SBOM attached by BuildKit
+    assert "docker/build-push-action@v6" in with_reg
+    assert "sbom: true" in with_reg
+    assert re.search(r"^\s+- name: 'Build & push image", with_reg, re.M)
     without = _gen(enabled_tools={})
-    assert re.search(r"^\s+- name: 'Build and push image'", without, re.M) is None
+    assert re.search(r"^\s+- name: 'Build & push image", without, re.M) is None
     assert "# REGISTRY - not selected in the orchestrator UI" in without
+
+
+def test_sbom_attached_via_buildkit_not_a_placeholder():
+    """SBOM is generated+attached by BuildKit on push; the old echo placeholder
+    and the manual docker build/push are gone."""
+    wf = _gen(enabled_tools={"registry": "GHCR"})
+    assert "sbom: true" in wf
+    assert "docker/setup-buildx-action" in wf          # container driver for attestations
+    assert "SBOM generation (placeholder" not in wf     # echo stub removed
+    assert "docker push" not in wf                       # manual push replaced
 
 
 def test_selected_caps_maps_ui_labels():
