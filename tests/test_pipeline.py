@@ -83,3 +83,30 @@ def test_run_ci_pipeline_end_to_end_with_mocks():
     assert result["pr"]["pr_url"].endswith("/pull/7")
     assert {s["name"] for s in result["secrets"] if s["status"] == "set"} == {"SONAR_TOKEN", "REGISTRY_TOKEN"}
     assert result["repo"] == "komali/netcore-sample-app"
+
+
+def test_pipeline_uses_custom_pr_branch_from_options():
+    """The UI's 'PR branch' field (options.pr_branch) names the branch the agent
+    creates and opens the PR from; blank falls back to ci/netcore-<repo>."""
+    discover = MagicMock()
+    discover.run.return_value = {"target_framework": ".NET 8", "build_tool": ".NET CLI",
+                                 "project_files": [], "solution_file": None,
+                                 "docker_support": True, "helm_support": False,
+                                 "existing_ci_pipeline": False}
+    generate = MagicMock()
+    generate.run.return_value = {"status": "generated", "workflow_yaml": "name: x",
+                                 "workflow_path": ".github/workflows/ci.yml"}
+    validate = MagicMock(); validate.run.return_value = {"valid": True}
+
+    repo = _mock_repo()
+    result = run_ci_pipeline(
+        repo_url="https://github.com/komali/netcore-sample-app.git",
+        github_token="dummy",
+        options={"open_pr": True, "set_secrets": False, "pr_branch": "feature/my-ci"},
+        repo=repo,
+        discover_tool=discover, generate_tool=generate, validate_tool=validate,
+    )
+    assert result["status"] == "opened"
+    assert result["pr"]["branch"] == "feature/my-ci"
+    assert repo.create_git_ref.call_args.kwargs["ref"] == "refs/heads/feature/my-ci"
+    assert repo.create_pull.call_args.kwargs["head"] == "feature/my-ci"
