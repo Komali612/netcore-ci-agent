@@ -222,9 +222,21 @@ def run_ci_pipeline(
             body=_pr_body(name, secret_results),
         )
 
+    # CI->CD handoff (ARCHITECTURE.md §2.1): the image this pipeline will publish.
+    # The generated workflow's registry step pushes to GHCR as
+    # ghcr.io/<owner>/<repo>:<commit-sha> (lowercased); the CD agent deploys exactly
+    # that image, resolving the concrete tag at deploy time via its trigger.
+    handoff = {
+        "image_registry": "ghcr.io",
+        "image_name": full_name.lower(),
+        "image": f"ghcr.io/{full_name.lower()}",
+        "image_tag_scheme": "${{ github.sha }}",
+    }
+
     result = {
         "status": "opened" if pr else "generated",
         "repo": parse_repo_full_name(repo_url),
+        "handoff": handoff,
         "discovery": {
             "target_framework": framework,
             "existing_ci_pipeline": disc.get("existing_ci_pipeline"),
